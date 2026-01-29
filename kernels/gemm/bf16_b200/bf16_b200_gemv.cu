@@ -1,16 +1,3 @@
-/**
- * BF16 GEMV Kernel for B200
- *
- * Computes y = A * x where:
- *   - A is M×K (bf16, row-major)
- *   - x is K×1 (bf16)
- *   - y is M×1 (bf16)
- *
- * Approach: Use WGMMA tensor cores by treating GEMV as degenerate GEMM.
- * x is stored as a tile where row 0 = x values, rows 1..N-1 = 0.
- * We compute D = A * x_tile^T using mm_ABt/mma_ABt, then extract column 0 as y.
- */
-
 #include "kittens.cuh"
 #include "../common.cuh"
 
@@ -19,9 +6,9 @@ using namespace kittens;
 // Configuration for GEMV kernel
 template <int _Mb, int _Kb, int _PIPE_DEPTH>
 struct gemv_config {
-    static constexpr int Mb = _Mb;           // Rows per block (output elements per block)
-    static constexpr int Nb = 16;            // Fixed at 16 (minimum tile width for tensor cores)
-    static constexpr int Kb = _Kb;           // K tile size
+    static constexpr int Mb = _Mb;           
+    static constexpr int Nb = 16;           
+    static constexpr int Kb = _Kb;        
     static constexpr int PIPE_DEPTH = _PIPE_DEPTH;
 
     static constexpr int NUM_CONSUMERS = 1;
@@ -33,21 +20,18 @@ struct gemv_config {
 // Global memory descriptors for GEMV
 template <typename C>
 struct gemv_globals {
-    // A tile: Mb x Kb chunk of the matrix
     using a_tile = st_bf<C::Mb, C::Kb>;
-    // x tile: Nb x Kb - row 0 holds x values, rest are zeros
-    // Note: For ABt operation, B is Nb x Kb, transposed gives Kb x Nb
     using x_tile = st_bf<C::Nb, C::Kb>;
-    // y tile: Mb x Nb output (we only use column 0)
+    // note we only use column 0
     using y_tile = st_bf<C::Mb, C::Nb>;
 
     using a_gl = gl<bf16, 1, 1, -1, -1, a_tile>;
     using x_gl = gl<bf16, 1, 1, -1, -1, x_tile>;
     using y_gl = gl<bf16, 1, 1, -1, -1, y_tile>;
 
-    a_gl a;  // Matrix A: M x K
-    x_gl x;  // Vector x stored as tiles: (K/Kb) x 1 tiles, each Nb x Kb
-    y_gl y;  // Output y stored as tiles: (M/Mb) x 1 tiles, each Mb x Nb
+    a_gl a;   
+    x_gl x;  
+    y_gl y;   
 
     int M, K;
 
@@ -74,8 +58,8 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
         g.y.template prefetch_tma<typename G::y_tile>();
     }
 
-    const int row_block = blockIdx.x;  // Which Mb-row block we're computing
-    const int iters_per_task = g.K / C::Kb;  // Number of K iterations
+    const int row_block = blockIdx.x;   
+    const int iters_per_task = g.K / C::Kb;   
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
@@ -84,7 +68,7 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
     typename G::x_tile (&x_smem)[C::PIPE_DEPTH] = al.allocate<typename G::x_tile, C::PIPE_DEPTH>();
     typename G::y_tile (&y_smem)                = al.allocate<typename G::y_tile>();
 
-    // Tensor memory allocator for accumulator
+    // tmem allocator
     tensor_allocator<1, 1> tm_alloc{};
     using d_tt_t = tt<float, C::Mb, C::Nb>;
 
@@ -106,7 +90,7 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
     int warpgroupid = warpgroup::groupid();
 
     if (warpgroupid == C::NUM_CONSUMERS) {
-        // Producer warpgroup
+        // producer wg doesnt need these
         warpgroup::decrease_registers<56>();
 
         if (warpgroup::warpid() == 3 && warp::laneid() == 0) {
@@ -132,20 +116,20 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
             arrive(outputs_arrived);
         }
         else if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
-            // MMA issuer thread
+            
             d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
             int input_ring = 0;
 
-            // Wait for outputs_finished to ensure tensor memory is ready
+            // wait to ensure TMEM is ready
             wait(outputs_finished, 1);
 
-            // First iteration: mm (no accumulate)
+            // first iteration just uses mm
             wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
             update_phasebit<0>(bitfield, input_ring);
             mm_ABt(d_tt, a_smem[input_ring], x_smem[input_ring], inputs_finished[input_ring]);
             input_ring = ring_advance<C::PIPE_DEPTH>(input_ring);
 
-            // Remaining iterations: mma (accumulate)
+            // remaining use mma
             for (int idx = 1; idx < iters_per_task; idx++) {
                 wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
                 update_phasebit<0>(bitfield, input_ring);
@@ -155,28 +139,27 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
         }
     }
     else {
-        // Consumer warpgroup (epilogue)
+        // consumer epilogue
         warpgroup::increase_registers<224>();
 
         d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
 
-        // Wait for MMA to complete
+        // wait for mma
         wait(outputs_arrived, 0);
 
-        // Load result from tensor memory
+        // load result from TMEM
         rt_bf<C::Mb/4, C::Nb> d_reg;
         warpgroup::load_async(d_reg, d_tt);
         tensor_load_wait();
 
-        // Signal that tensor memory is free
+        // signal TMEM is free
         warpgroup::sync(warpgroupid + 1);
         if (warpgroup::laneid() == 0) arrive(outputs_finished);
 
-        // Store to shared memory
         warpgroup::store(y_smem, d_reg);
         warpgroup::sync(warpgroupid + 1);
 
-        // TMA store to global memory
+        // go to global memory
         if (warpgroup::laneid() == 0) {
             tma::store_async(g.y, y_smem, {row_block, 0});
         }
@@ -186,7 +169,7 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
     __syncthreads();
 }
 
-// Reference GEMV: y = A * x
+// Reference GEMV
 template <typename T>
 __global__ void reference_gemv_kernel(T* y, const T* A, const T* x, int M, int K) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -208,73 +191,28 @@ void reference_gemv(T* y, const T* A, const T* x, int M, int K) {
     reference_gemv_kernel<T><<<grid, block>>>(y, A, x, M, K);
 }
 
-// Prepare x vector as tiles (row 0 = x values, rest = 0)
-// x_tiles is a 2D row-major array of shape (Nb, K)
-// TMA will load tiles of shape (Nb, Kb) from positions {0, idx}
+// change the x vector to a tile where only the 0th row is relevant x and the other rows are 0s
 template <typename C>
 __global__ void prepare_x_tiles(bf16* x_tiles, const bf16* x, int K) {
-    // x_tiles layout: Nb rows, K columns (row-major)
-    // Row 0 = x values, rows 1..Nb-1 = 0
-
-    int k = blockIdx.x * blockDim.x + threadIdx.x;  // Column index (0 to K-1)
-
+    int k = blockIdx.x * blockDim.x + threadIdx.x; 
     if (k < K) {
-        // Row 0: copy x value
         x_tiles[k] = x[k];
 
-        // Rows 1..Nb-1: zeros
+        // make all of these 0s
         for (int row = 1; row < C::Nb; row++) {
             x_tiles[row * K + k] = kittens::base_types::convertor<bf16, float>::convert(0.0f);
         }
     }
 }
 
-// Extract y from output tiles (column 0)
-// y_tiles is a 2D row-major array of shape (M, Nb)
-// TMA stored tiles of shape (Mb, Nb) at positions {tile_idx, 0}
+
 template <typename C>
 __global__ void extract_y(bf16* y, const bf16* y_tiles, int M, int Nb_stride) {
-    // y_tiles layout: M rows, Nb columns (row-major)
-    // Column 0 of y_tiles = y values
-
-    int m = blockIdx.x * blockDim.x + threadIdx.x;  // Row index (0 to M-1)
+    int m = blockIdx.x * blockDim.x + threadIdx.x;  
 
     if (m < M) {
-        // Extract column 0: y[m] = y_tiles[m, 0] = y_tiles[m * Nb + 0]
         y[m] = y_tiles[m * Nb_stride];
     }
-}
-
-// Check correctness for GEMV
-template <typename T>
-void check_gemv_correctness(const T* d_out, const T* d_ref, size_t count) {
-    std::vector<T> h_out(count);
-    std::vector<T> h_ref(count);
-
-    cudaMemcpy(h_out.data(), d_out, count * sizeof(T), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ref.data(), d_ref, count * sizeof(T), cudaMemcpyDeviceToHost);
-
-    double abs_sum = 0.0, abs_max = 0.0;
-    double err_sum = 0.0, err_max = 0.0;
-
-    for (size_t i = 0; i < count; i++) {
-        float val = kittens::base_types::convertor<float, T>::convert(h_out[i]);
-        float ref = kittens::base_types::convertor<float, T>::convert(h_ref[i]);
-        float err = std::abs(val - ref);
-
-        abs_sum += std::abs(val);
-        abs_max = std::max(abs_max, (double)std::abs(val));
-        err_sum += err;
-        err_max = std::max(err_max, (double)err);
-    }
-
-    double abs_mean = abs_sum / count;
-    double err_mean = err_sum / count;
-
-    std::cout << "abs mean: " << std::setw(12) << abs_mean << std::endl;
-    std::cout << "abs max:  " << std::setw(12) << abs_max << std::endl;
-    std::cout << "err mean: " << std::setw(12) << err_mean << std::endl;
-    std::cout << "err max:  " << std::setw(12) << err_max << std::endl;
 }
 
 template <typename C>
@@ -387,7 +325,7 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     extract_y<C><<<(M + 255) / 256, 256>>>(d_y[0], d_y_tiles[0], M, C::Nb);
     CUDACHECK(cudaDeviceSynchronize());
 
-    check_gemv_correctness(d_y[0], d_y_ref, M);
+    check_correctness(d_y[0], d_y_ref, M);
 
     // Cleanup
     for (int i = 0; i < arg_group_count; i++) {
