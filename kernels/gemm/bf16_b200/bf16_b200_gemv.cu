@@ -289,7 +289,9 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::vector<gemv_globals<C>> g;
     for (int i = 0; i < arg_group_count; i++) {
         typename gemv_globals<C>::a_gl Ag{d_A[i], nullptr, nullptr, M, K};
-        typename gemv_globals<C>::x_gl Xg{d_x[i], nullptr, nullptr, 1, K};  // 1×K vector (no padding!)
+        // x_gl is gl<bf16, 1, 1, 1, -1>: b=1(fixed), d=1(fixed), r=1(fixed), c=-1(dynamic)
+        // Fixed dimensions get nullptr, dynamic dimensions get the actual value
+        typename gemv_globals<C>::x_gl Xg{d_x[i], nullptr, nullptr, nullptr, K};
         typename gemv_globals<C>::y_gl Yg{d_y_tiles[i], nullptr, nullptr, M, C::Nb};
         g.push_back(gemv_globals<C>{Ag, Xg, Yg, (int)M, (int)K});
     }
