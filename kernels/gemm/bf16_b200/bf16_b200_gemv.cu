@@ -6,9 +6,9 @@ using namespace kittens;
 // configuration for GEMV
 template <int _Mb, int _Kb, int _PIPE_DEPTH>
 struct gemv_config {
-    static constexpr int Mb = _Mb;           
-    static constexpr int Nb = 16;           
-    static constexpr int Kb = _Kb;        
+    static constexpr int Mb = _Mb;
+    static constexpr int Nb = 16;
+    static constexpr int Kb = _Kb;
     static constexpr int PIPE_DEPTH = _PIPE_DEPTH;
 
     static constexpr int NUM_CONSUMERS = 1;
@@ -21,17 +21,16 @@ struct gemv_config {
 template <typename C>
 struct gemv_globals {
     using a_tile = st_bf<C::Mb, C::Kb>;
-    using x_tile = st_bf<C::Nb, C::Kb>;  // Nb×Kb tile in shared memory
+    using x_tile = st_bf<C::Nb, C::Kb>;
     // note we only use column 0
     using y_tile = st_bf<C::Mb, C::Nb>;
 
     using a_gl = gl<bf16, 1, 1, -1, -1, a_tile>;
-    // x is now stored as a 1D vector (K elements), not a 2D tile
-    using x_gl = gl<bf16, 1, 1, 1, -1>;  // 1×K vector
+    using x_gl = gl<bf16, 1, 1, -1, -1, x_tile>;
     using y_gl = gl<bf16, 1, 1, -1, -1, y_tile>;
 
     a_gl a;
-    x_gl x;   // Now points to raw x vector (K elements)
+    x_gl x;
     y_gl y;
 
     int M, K;
@@ -52,15 +51,15 @@ __launch_bounds__(C::NUM_THREADS, 1)
 __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
     using G = gemv_globals<C>;
 
-    // TMA prefetch (only A and y use TMA now, x is loaded directly)
+    // TMA prefetch
     if (threadIdx.x == 0) {
         g.a.template prefetch_tma<typename G::a_tile>();
-        // x is loaded as raw vector, no TMA prefetch needed
+        g.x.template prefetch_tma<typename G::x_tile>();
         g.y.template prefetch_tma<typename G::y_tile>();
     }
 
-    const int row_block = blockIdx.x;   
-    const int iters_per_task = g.K / C::Kb;   
+    const int row_block = blockIdx.x;
+    const int iters_per_task = g.K / C::Kb;
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
@@ -95,17 +94,16 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
         warpgroup::decrease_registers<56>();
 
         if (warpgroup::warpid() == 3 && warp::laneid() == 0) {
-            // TMA loader thread - only loads A tiles now
+            // TMA loader thread
             int input_ring = 0;
 
             for (int idx = 0; idx < iters_per_task; idx++) {
                 wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
                 update_phasebit<1>(bitfield, input_ring);
 
-                // Only expect and load A tile via TMA
-                // x will be loaded separately by the warpgroup
-                tma::expect(inputs_arrived[input_ring], a_smem[0]);
+                tma::expect(inputs_arrived[input_ring], a_smem[0], x_smem[0]);
                 tma::load_async(a_smem[input_ring], g.a, {row_block, idx}, inputs_arrived[input_ring]);
+                tma::load_async(x_smem[input_ring], g.x, {0, idx}, inputs_arrived[input_ring]);
 
                 input_ring = ring_advance<C::PIPE_DEPTH>(input_ring);
             }
@@ -117,52 +115,25 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
             }
             arrive(outputs_arrived);
         }
-        else if (warpgroup::warpid() == 0) {
-            // MMA issuer warp - also helps load x vector
+        else if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+
             d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
             int input_ring = 0;
-            const int lane = warp::laneid();
 
             // wait to ensure TMEM is ready
-            if (lane == 0) wait(outputs_finished, 1);
+            wait(outputs_finished, 1);
 
-            for (int idx = 0; idx < iters_per_task; idx++) {
-                // Load x vector (Kb elements) into row 0 of x_smem
-                // Each thread in warp loads multiple elements
-                const int x_offset = idx * C::Kb;
-                bf16* x_row0 = reinterpret_cast<bf16*>(&x_smem[input_ring]);
+            // first iteration just uses mm
+            wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
+            update_phasebit<0>(bitfield, input_ring);
+            mm_ABt(d_tt, a_smem[input_ring], x_smem[input_ring], inputs_finished[input_ring]);
+            input_ring = ring_advance<C::PIPE_DEPTH>(input_ring);
 
-                #pragma unroll
-                for (int k = lane; k < C::Kb; k += 32) {
-                    x_row0[k] = *(g.x.raw_ptr + x_offset + k);
-                }
-
-                // Zero out rows 1 to Nb-1 of x_smem
-                #pragma unroll
-                for (int row = 1; row < C::Nb; row++) {
-                    bf16* x_row = x_row0 + row * C::Kb;
-                    #pragma unroll
-                    for (int k = lane; k < C::Kb; k += 32) {
-                        x_row[k] = __float2bfloat16(0.0f);
-                    }
-                }
-                __syncwarp();
-
-                // Wait for A tile to arrive
-                if (lane == 0) {
-                    wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
-                    update_phasebit<0>(bitfield, input_ring);
-                }
-                __syncwarp();
-
-                // Issue MMA
-                if (lane == 0) {
-                    if (idx == 0) {
-                        mm_ABt(d_tt, a_smem[input_ring], x_smem[input_ring], inputs_finished[input_ring]);
-                    } else {
-                        mma_ABt(d_tt, a_smem[input_ring], x_smem[input_ring], inputs_finished[input_ring]);
-                    }
-                }
+            // remaining use mma
+            for (int idx = 1; idx < iters_per_task; idx++) {
+                wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
+                update_phasebit<0>(bitfield, input_ring);
+                mma_ABt(d_tt, a_smem[input_ring], x_smem[input_ring], inputs_finished[input_ring]);
                 input_ring = ring_advance<C::PIPE_DEPTH>(input_ring);
             }
         }
@@ -220,12 +191,24 @@ void reference_gemv(T* y, const T* A, const T* x, int M, int K) {
     reference_gemv_kernel<T><<<grid, block>>>(y, A, x, M, K);
 }
 
-// prepare_x_tiles is no longer needed - x is loaded directly as a vector in the kernel
+// change the x vector to a tile where only the 0th row is relevant x and the other rows are 0s
+template <typename C>
+__global__ void prepare_x_tiles(bf16* x_tiles, const bf16* x, int K) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < K) {
+        x_tiles[k] = x[k];
+
+        // make all of these 0s
+        for (int row = 1; row < C::Nb; row++) {
+            x_tiles[row * K + k] = kittens::base_types::convertor<bf16, float>::convert(0.0f);
+        }
+    }
+}
 
 // do the same for the y vector as the x vector
 template <typename C>
 __global__ void extract_y(bf16* y, const bf16* y_tiles, int M, int Nb_stride) {
-    int m = blockIdx.x * blockDim.x + threadIdx.x;  
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (m < M) {
         y[m] = y_tiles[m * Nb_stride];
@@ -248,19 +231,23 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
     const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
 
+    // Number of K tiles
+    int num_k_tiles = K / C::Kb;
     // Number of M tiles
     int num_m_tiles = M / C::Mb;
 
     // Allocate device memory
     std::vector<bf16*> d_A(arg_group_count);
-    std::vector<bf16*> d_x(arg_group_count);        // x vector (K elements, no padding!)
+    std::vector<bf16*> d_x(arg_group_count);        // Original x vector
+    std::vector<bf16*> d_x_tiles(arg_group_count);  // x prepared as tiles
     std::vector<bf16*> d_y_tiles(arg_group_count);  // y as tiles (kernel output)
     std::vector<bf16*> d_y(arg_group_count);        // y extracted from tiles
     bf16* d_y_ref;
 
     for (int i = 0; i < arg_group_count; i++) {
         CUDACHECK(cudaMalloc(&d_A[i], M * K * sizeof(bf16)));
-        CUDACHECK(cudaMalloc(&d_x[i], K * sizeof(bf16)));  // Just K elements, not Nb*K!
+        CUDACHECK(cudaMalloc(&d_x[i], K * sizeof(bf16)));
+        CUDACHECK(cudaMalloc(&d_x_tiles[i], num_k_tiles * C::Nb * C::Kb * sizeof(bf16)));
         CUDACHECK(cudaMalloc(&d_y_tiles[i], num_m_tiles * C::Mb * C::Nb * sizeof(bf16)));
         CUDACHECK(cudaMalloc(&d_y[i], M * sizeof(bf16)));
     }
@@ -274,7 +261,9 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         fill<bf16, FillMode::RANDOM>(d_x[i], K, seed + i * 100 + 1, -1.0f, 1.0f);
         fill<bf16, FillMode::CONSTANT>(d_y[i], M, 0.0f);
         fill<bf16, FillMode::CONSTANT>(d_y_tiles[i], num_m_tiles * C::Mb * C::Nb, 0.0f);
-        // No more prepare_x_tiles - x is loaded directly in the kernel!
+
+        // Prepare x tiles (2D row-major array of shape Nb x K)
+        prepare_x_tiles<C><<<(K + 255) / 256, 256>>>(d_x_tiles[i], d_x[i], K);
     }
     fill<bf16, FillMode::CONSTANT>(d_y_ref, M, 0.0f);
     CUDACHECK(cudaDeviceSynchronize());
@@ -289,9 +278,7 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::vector<gemv_globals<C>> g;
     for (int i = 0; i < arg_group_count; i++) {
         typename gemv_globals<C>::a_gl Ag{d_A[i], nullptr, nullptr, M, K};
-        // x_gl is gl<bf16, 1, 1, 1, -1>: b=1(fixed), d=1(fixed), r=1(fixed), c=-1(dynamic)
-        // Fixed dimensions get nullptr, dynamic dimensions get the actual value
-        typename gemv_globals<C>::x_gl Xg{d_x[i], nullptr, nullptr, nullptr, K};
+        typename gemv_globals<C>::x_gl Xg{d_x_tiles[i], nullptr, nullptr, (size_t)C::Nb, (size_t)K};
         typename gemv_globals<C>::y_gl Yg{d_y_tiles[i], nullptr, nullptr, M, C::Nb};
         g.push_back(gemv_globals<C>{Ag, Xg, Yg, (int)M, (int)K});
     }
@@ -344,6 +331,7 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     for (int i = 0; i < arg_group_count; i++) {
         cudaFree(d_A[i]);
         cudaFree(d_x[i]);
+        cudaFree(d_x_tiles[i]);
         cudaFree(d_y_tiles[i]);
         cudaFree(d_y[i]);
     }
