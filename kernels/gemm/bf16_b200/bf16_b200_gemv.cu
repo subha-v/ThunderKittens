@@ -3,7 +3,7 @@
 
 using namespace kittens;
 
-// Configuration for GEMV kernel
+// configuration for GEMV
 template <int _Mb, int _Kb, int _PIPE_DEPTH>
 struct gemv_config {
     static constexpr int Mb = _Mb;           
@@ -17,7 +17,7 @@ struct gemv_config {
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 };
 
-// Global memory descriptors for GEMV
+// global memory descriptors
 template <typename C>
 struct gemv_globals {
     using a_tile = st_bf<C::Mb, C::Kb>;
@@ -169,7 +169,7 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
     __syncthreads();
 }
 
-// Reference GEMV
+// reference GEMV
 template <typename T>
 __global__ void reference_gemv_kernel(T* y, const T* A, const T* x, int M, int K) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -205,7 +205,7 @@ __global__ void prepare_x_tiles(bf16* x_tiles, const bf16* x, int K) {
     }
 }
 
-
+// do the same for the y vector as the x vector
 template <typename C>
 __global__ void extract_y(bf16* y, const bf16* y_tiles, int M, int Nb_stride) {
     int m = blockIdx.x * blockDim.x + threadIdx.x;  
