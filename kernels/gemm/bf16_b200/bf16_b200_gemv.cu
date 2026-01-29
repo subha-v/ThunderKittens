@@ -209,46 +209,39 @@ void reference_gemv(T* y, const T* A, const T* x, int M, int K) {
 }
 
 // Prepare x vector as tiles (row 0 = x values, rest = 0)
+// x_tiles is a 2D row-major array of shape (Nb, K)
+// TMA will load tiles of shape (Nb, Kb) from positions {0, idx}
 template <typename C>
 __global__ void prepare_x_tiles(bf16* x_tiles, const bf16* x, int K) {
-    // x_tiles layout: (K/Kb) tiles, each Nb x Kb
-    // Row 0 of each tile = x[k*Kb : (k+1)*Kb]
-    // Rows 1..Nb-1 = 0
+    // x_tiles layout: Nb rows, K columns (row-major)
+    // Row 0 = x values, rows 1..Nb-1 = 0
 
-    int tile_idx = blockIdx.x;  // Which K tile
-    int col = threadIdx.x;      // Column within tile (0..Kb-1)
+    int k = blockIdx.x * blockDim.x + threadIdx.x;  // Column index (0 to K-1)
 
-    if (col < C::Kb) {
-        int k = tile_idx * C::Kb + col;
-
+    if (k < K) {
         // Row 0: copy x value
-        if (k < K) {
-            x_tiles[tile_idx * (C::Nb * C::Kb) + col] = x[k];
-        }
+        x_tiles[k] = x[k];
 
         // Rows 1..Nb-1: zeros
         for (int row = 1; row < C::Nb; row++) {
-            x_tiles[tile_idx * (C::Nb * C::Kb) + row * C::Kb + col] =
-                kittens::base_types::convertor<bf16, float>::convert(0.0f);
+            x_tiles[row * K + k] = kittens::base_types::convertor<bf16, float>::convert(0.0f);
         }
     }
 }
 
 // Extract y from output tiles (column 0)
+// y_tiles is a 2D row-major array of shape (M, Nb)
+// TMA stored tiles of shape (Mb, Nb) at positions {tile_idx, 0}
 template <typename C>
-__global__ void extract_y(bf16* y, const bf16* y_tiles, int M) {
-    // y_tiles layout: (M/Mb) tiles, each Mb x Nb
-    // Column 0 of each tile = y[m*Mb : (m+1)*Mb]
+__global__ void extract_y(bf16* y, const bf16* y_tiles, int M, int Nb_stride) {
+    // y_tiles layout: M rows, Nb columns (row-major)
+    // Column 0 of y_tiles = y values
 
-    int tile_idx = blockIdx.x;  // Which M tile
-    int row = threadIdx.x;      // Row within tile (0..Mb-1)
+    int m = blockIdx.x * blockDim.x + threadIdx.x;  // Row index (0 to M-1)
 
-    if (row < C::Mb) {
-        int m = tile_idx * C::Mb + row;
-        if (m < M) {
-            // Extract column 0
-            y[m] = y_tiles[tile_idx * (C::Mb * C::Nb) + row * C::Nb + 0];
-        }
+    if (m < M) {
+        // Extract column 0: y[m] = y_tiles[m, 0] = y_tiles[m * Nb + 0]
+        y[m] = y_tiles[m * Nb_stride];
     }
 }
 
@@ -331,8 +324,8 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         fill<bf16, FillMode::CONSTANT>(d_y[i], M, 0.0f);
         fill<bf16, FillMode::CONSTANT>(d_y_tiles[i], num_m_tiles * C::Mb * C::Nb, 0.0f);
 
-        // Prepare x tiles
-        prepare_x_tiles<C><<<num_k_tiles, C::Kb>>>(d_x_tiles[i], d_x[i], K);
+        // Prepare x tiles (2D row-major array of shape Nb x K)
+        prepare_x_tiles<C><<<(K + 255) / 256, 256>>>(d_x_tiles[i], d_x[i], K);
     }
     fill<bf16, FillMode::CONSTANT>(d_y_ref, M, 0.0f);
     CUDACHECK(cudaDeviceSynchronize());
@@ -347,7 +340,7 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::vector<gemv_globals<C>> g;
     for (int i = 0; i < arg_group_count; i++) {
         typename gemv_globals<C>::a_gl Ag{d_A[i], nullptr, nullptr, M, K};
-        typename gemv_globals<C>::x_gl Xg{d_x_tiles[i], nullptr, nullptr, C::Nb, num_k_tiles * C::Kb};
+        typename gemv_globals<C>::x_gl Xg{d_x_tiles[i], nullptr, nullptr, (size_t)C::Nb, (size_t)K};
         typename gemv_globals<C>::y_gl Yg{d_y_tiles[i], nullptr, nullptr, M, C::Nb};
         g.push_back(gemv_globals<C>{Ag, Xg, Yg, (int)M, (int)K});
     }
@@ -390,8 +383,8 @@ __host__ double run_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::cout << "Achieved bandwidth: " << gb_per_sec << " GB/s\n";
     std::cout << "Achieved performance: " << gflops << " GFLOPs\n";
 
-    // Extract y from tiles and verify correctness
-    extract_y<C><<<num_m_tiles, C::Mb>>>(d_y[0], d_y_tiles[0], M);
+    // Extract y from tiles (2D row-major array of shape M x Nb)
+    extract_y<C><<<(M + 255) / 256, 256>>>(d_y[0], d_y_tiles[0], M, C::Nb);
     CUDACHECK(cudaDeviceSynchronize());
 
     check_gemv_correctness(d_y[0], d_y_ref, M);
