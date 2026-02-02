@@ -3,4 +3,4 @@ SRC := bf16_b200_gemv_testing.cu
 OUT := bf16_b200_gemv_testing.out
 CMD := ./bf16_b200_gemv_testing.out
 CONFIG := standalone
-include ../../../common.mk
+include ../../common.mk
