@@ -105,6 +105,8 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
                 update_phasebit<1>(bitfield, input_ring);
                 // setting up transaction count
                 tma::expect(inputs_arrived[input_ring], a_smem[0], x_smem[0]);
+
+                // this is the real work that goes and grabs A from TMA, takes 8 clock cycles
                 tma::load_async(a_smem[input_ring], g.a, {row_block, idx}, inputs_arrived[input_ring]);
                 tma::load_async(x_smem[input_ring], g.x, {0, idx}, inputs_arrived[input_ring]);
 
