@@ -230,7 +230,7 @@ __global__ void fma_gemv_kernel_v4(
     }
 }
 
-// Kernel v5: cp.async pipelining with double buffering
+// Kernel v5: Vectorized loads using float4 (8 bytes = 4 bf16 at once)
 template <int BLOCK_SIZE = 256, int K_CHUNK = 256>
 __global__ void fma_gemv_kernel_v5(
     bf16* __restrict__ y,
@@ -245,53 +245,35 @@ __global__ void fma_gemv_kernel_v5(
 
     if (row >= M) return;
 
-    __shared__ bf16 x_smem[2][K_CHUNK];  // Double buffer
+    __shared__ bf16 x_smem[K_CHUNK];
     float acc = 0.0f;
 
     const bf16* A_row = A + row * K;
-    int curr_buf = 0;
-
-    // Prefetch first chunk using cp.async
-    for (int k = threadIdx.x; k < K_CHUNK && k < K; k += BLOCK_SIZE) {
-        asm volatile(
-            "cp.async.cg.shared.global [%0], [%1], 2;"
-            :: "r"(static_cast<unsigned>(__cvta_generic_to_shared(&x_smem[curr_buf][k]))),
-               "l"(&x[k])
-        );
-    }
-    asm volatile("cp.async.commit_group;");
 
     for (int k_base = 0; k_base < K; k_base += K_CHUNK) {
-        int next_buf = 1 - curr_buf;
-        int next_k_base = k_base + K_CHUNK;
-
-        // Start loading next chunk asynchronously
-        if (next_k_base < K) {
-            for (int k = threadIdx.x; k < K_CHUNK && (next_k_base + k) < K; k += BLOCK_SIZE) {
-                asm volatile(
-                    "cp.async.cg.shared.global [%0], [%1], 2;"
-                    :: "r"(static_cast<unsigned>(__cvta_generic_to_shared(&x_smem[next_buf][k]))),
-                       "l"(&x[next_k_base + k])
-                );
+        // Vectorized load of x chunk - load 4 bf16 (8 bytes) at a time
+        const int k_chunk_end = min(K_CHUNK, K - k_base);
+        for (int k = threadIdx.x * 4; k < k_chunk_end; k += BLOCK_SIZE * 4) {
+            if (k + 3 < k_chunk_end) {
+                // Load 4 bf16s as two floats (8 bytes)
+                float2 tmp = *reinterpret_cast<const float2*>(&x[k_base + k]);
+                *reinterpret_cast<float2*>(&x_smem[k]) = tmp;
+            } else {
+                // Handle tail
+                for (int i = 0; i < 4 && (k + i) < k_chunk_end; i++) {
+                    x_smem[k + i] = x[k_base + k + i];
+                }
             }
-            asm volatile("cp.async.commit_group;");
         }
-
-        // Wait for current chunk to arrive
-        asm volatile("cp.async.wait_group 1;");
         __syncthreads();
 
-        const int k_end = min(K_CHUNK, K - k_base);
-
-        // Each lane processes with stride 32 (coalesced)
-        for (int k = lane_id; k < k_end; k += 32) {
+        // Each lane processes with stride 32 (coalesced A access)
+        for (int k = lane_id; k < k_chunk_end; k += 32) {
             float a_val = __bfloat162float(A_row[k_base + k]);
-            float x_val = __bfloat162float(x_smem[curr_buf][k]);
+            float x_val = __bfloat162float(x_smem[k]);
             acc = fmaf(a_val, x_val, acc);
         }
-
         __syncthreads();
-        curr_buf = next_buf;
     }
 
     // Warp reduction
