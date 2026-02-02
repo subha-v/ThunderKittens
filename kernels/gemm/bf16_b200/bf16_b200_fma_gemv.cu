@@ -177,6 +177,205 @@ __global__ void fma_gemv_kernel_v3(
     }
 }
 
+// Kernel v4: Warp-Coalesced - Each warp computes ONE output row with coalesced loads
+// This fixes the memory coalescing issue in v1-v3 where each thread reads its own row
+template <int BLOCK_SIZE = 256, int K_CHUNK = 256>
+__global__ void fma_gemv_kernel_v4(
+    bf16* __restrict__ y,
+    const bf16* __restrict__ A,
+    const bf16* __restrict__ x,
+    int M, int K
+) {
+    // Each warp handles one output row
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warps_per_block = BLOCK_SIZE / 32;
+    const int row = blockIdx.x * warps_per_block + warp_id;
+
+    if (row >= M) return;
+
+    __shared__ bf16 x_smem[K_CHUNK];
+    float acc = 0.0f;
+
+    const bf16* A_row = A + row * K;
+
+    for (int k_base = 0; k_base < K; k_base += K_CHUNK) {
+        // Collaborative load of x chunk (coalesced across all threads!)
+        for (int k = threadIdx.x; k < K_CHUNK && (k_base + k) < K; k += BLOCK_SIZE) {
+            x_smem[k] = x[k_base + k];
+        }
+        __syncthreads();
+
+        const int k_end = min(K_CHUNK, K - k_base);
+
+        // Each lane processes K_CHUNK/32 elements with stride 32
+        // This is coalesced memory access: adjacent lanes access adjacent A elements
+        for (int k = lane_id; k < k_end; k += 32) {
+            float a_val = __bfloat162float(A_row[k_base + k]);
+            float x_val = __bfloat162float(x_smem[k]);
+            acc = fmaf(a_val, x_val, acc);
+        }
+        __syncthreads();
+    }
+
+    // Warp reduction using shuffle
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    // Lane 0 writes result
+    if (lane_id == 0) {
+        y[row] = __float2bfloat16(acc);
+    }
+}
+
+// Kernel v5: cp.async pipelining with double buffering
+template <int BLOCK_SIZE = 256, int K_CHUNK = 256>
+__global__ void fma_gemv_kernel_v5(
+    bf16* __restrict__ y,
+    const bf16* __restrict__ A,
+    const bf16* __restrict__ x,
+    int M, int K
+) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warps_per_block = BLOCK_SIZE / 32;
+    const int row = blockIdx.x * warps_per_block + warp_id;
+
+    if (row >= M) return;
+
+    __shared__ bf16 x_smem[2][K_CHUNK];  // Double buffer
+    float acc = 0.0f;
+
+    const bf16* A_row = A + row * K;
+    int curr_buf = 0;
+
+    // Prefetch first chunk using cp.async
+    for (int k = threadIdx.x; k < K_CHUNK && k < K; k += BLOCK_SIZE) {
+        asm volatile(
+            "cp.async.cg.shared.global [%0], [%1], 2;"
+            :: "r"(static_cast<unsigned>(__cvta_generic_to_shared(&x_smem[curr_buf][k]))),
+               "l"(&x[k])
+        );
+    }
+    asm volatile("cp.async.commit_group;");
+
+    for (int k_base = 0; k_base < K; k_base += K_CHUNK) {
+        int next_buf = 1 - curr_buf;
+        int next_k_base = k_base + K_CHUNK;
+
+        // Start loading next chunk asynchronously
+        if (next_k_base < K) {
+            for (int k = threadIdx.x; k < K_CHUNK && (next_k_base + k) < K; k += BLOCK_SIZE) {
+                asm volatile(
+                    "cp.async.cg.shared.global [%0], [%1], 2;"
+                    :: "r"(static_cast<unsigned>(__cvta_generic_to_shared(&x_smem[next_buf][k]))),
+                       "l"(&x[next_k_base + k])
+                );
+            }
+            asm volatile("cp.async.commit_group;");
+        }
+
+        // Wait for current chunk to arrive
+        asm volatile("cp.async.wait_group 1;");
+        __syncthreads();
+
+        const int k_end = min(K_CHUNK, K - k_base);
+
+        // Each lane processes with stride 32 (coalesced)
+        for (int k = lane_id; k < k_end; k += 32) {
+            float a_val = __bfloat162float(A_row[k_base + k]);
+            float x_val = __bfloat162float(x_smem[curr_buf][k]);
+            acc = fmaf(a_val, x_val, acc);
+        }
+
+        __syncthreads();
+        curr_buf = next_buf;
+    }
+
+    // Warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane_id == 0) {
+        y[row] = __float2bfloat16(acc);
+    }
+}
+
+// Kernel v6: Multiple rows per warp for higher arithmetic intensity
+// Each warp processes 4 rows simultaneously, improving register utilization
+template <int BLOCK_SIZE = 256, int K_CHUNK = 256, int ROWS_PER_WARP = 4>
+__global__ void fma_gemv_kernel_v6(
+    bf16* __restrict__ y,
+    const bf16* __restrict__ A,
+    const bf16* __restrict__ x,
+    int M, int K
+) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warps_per_block = BLOCK_SIZE / 32;
+    const int base_row = blockIdx.x * warps_per_block * ROWS_PER_WARP + warp_id * ROWS_PER_WARP;
+
+    __shared__ bf16 x_smem[K_CHUNK];
+
+    // Accumulators for multiple rows
+    float acc[ROWS_PER_WARP] = {0.0f};
+
+    // Precompute row pointers
+    const bf16* A_rows[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        A_rows[r] = (base_row + r < M) ? A + (base_row + r) * K : nullptr;
+    }
+
+    for (int k_base = 0; k_base < K; k_base += K_CHUNK) {
+        // Collaborative load of x chunk
+        for (int k = threadIdx.x; k < K_CHUNK && (k_base + k) < K; k += BLOCK_SIZE) {
+            x_smem[k] = x[k_base + k];
+        }
+        __syncthreads();
+
+        const int k_end = min(K_CHUNK, K - k_base);
+
+        // Each lane processes with stride 32
+        for (int k = lane_id; k < k_end; k += 32) {
+            float x_val = __bfloat162float(x_smem[k]);
+
+            // Process all rows using the same x value (broadcast within instruction)
+            #pragma unroll
+            for (int r = 0; r < ROWS_PER_WARP; r++) {
+                if (A_rows[r] != nullptr) {
+                    float a_val = __bfloat162float(A_rows[r][k_base + k]);
+                    acc[r] = fmaf(a_val, x_val, acc[r]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Warp reduction for each row
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            acc[r] += __shfl_down_sync(0xffffffff, acc[r], offset);
+        }
+    }
+
+    // Lane 0 writes all results
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            if (base_row + r < M) {
+                y[base_row + r] = __float2bfloat16(acc[r]);
+            }
+        }
+    }
+}
+
 // Reference GEMV for correctness check
 template <typename T>
 __global__ void reference_gemv_kernel(T* y, const T* A, const T* x, int M, int K) {
@@ -247,6 +446,8 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     // Kernel launch parameters
     constexpr int BLOCK_SIZE = 256;
     constexpr int K_CHUNK = 1024;
+    constexpr int K_CHUNK_SMALL = 256;  // For warp-coalesced kernels
+    constexpr int ROWS_PER_WARP = 4;
     dim3 block(BLOCK_SIZE);
     dim3 grid;
 
@@ -255,8 +456,16 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     } else if constexpr (KERNEL_VERSION == 2) {
         constexpr int ROWS_PER_THREAD = 4;
         grid = dim3((M + BLOCK_SIZE * ROWS_PER_THREAD - 1) / (BLOCK_SIZE * ROWS_PER_THREAD));
-    } else {
+    } else if constexpr (KERNEL_VERSION == 3) {
         grid = dim3((M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    } else if constexpr (KERNEL_VERSION == 4 || KERNEL_VERSION == 5) {
+        // Each warp handles one row
+        constexpr int warps_per_block = BLOCK_SIZE / 32;
+        grid = dim3((M + warps_per_block - 1) / warps_per_block);
+    } else if constexpr (KERNEL_VERSION == 6) {
+        // Each warp handles ROWS_PER_WARP rows
+        constexpr int warps_per_block = BLOCK_SIZE / 32;
+        grid = dim3((M + warps_per_block * ROWS_PER_WARP - 1) / (warps_per_block * ROWS_PER_WARP));
     }
 
     // Number of iterations
@@ -272,8 +481,14 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         } else if constexpr (KERNEL_VERSION == 2) {
             using Config = fma_gemv_config<BLOCK_SIZE, K_CHUNK>;
             fma_gemv_kernel_v2<Config, 4><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
-        } else {
+        } else if constexpr (KERNEL_VERSION == 3) {
             fma_gemv_kernel_v3<BLOCK_SIZE, K_CHUNK><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        } else if constexpr (KERNEL_VERSION == 4) {
+            fma_gemv_kernel_v4<BLOCK_SIZE, K_CHUNK_SMALL><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        } else if constexpr (KERNEL_VERSION == 5) {
+            fma_gemv_kernel_v5<BLOCK_SIZE, K_CHUNK_SMALL><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        } else if constexpr (KERNEL_VERSION == 6) {
+            fma_gemv_kernel_v6<BLOCK_SIZE, K_CHUNK_SMALL, ROWS_PER_WARP><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
         }
     }
     CUDACHECK(cudaDeviceSynchronize());
@@ -292,8 +507,14 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         } else if constexpr (KERNEL_VERSION == 2) {
             using Config = fma_gemv_config<BLOCK_SIZE, K_CHUNK>;
             fma_gemv_kernel_v2<Config, 4><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
-        } else {
+        } else if constexpr (KERNEL_VERSION == 3) {
             fma_gemv_kernel_v3<BLOCK_SIZE, K_CHUNK><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        } else if constexpr (KERNEL_VERSION == 4) {
+            fma_gemv_kernel_v4<BLOCK_SIZE, K_CHUNK_SMALL><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        } else if constexpr (KERNEL_VERSION == 5) {
+            fma_gemv_kernel_v5<BLOCK_SIZE, K_CHUNK_SMALL><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        } else if constexpr (KERNEL_VERSION == 6) {
+            fma_gemv_kernel_v6<BLOCK_SIZE, K_CHUNK_SMALL, ROWS_PER_WARP><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
         }
     }
 
@@ -348,6 +569,24 @@ __host__ int main() {
     run_fma_gemv_benchmark<3>(8192, 8192, ncu);
     run_fma_gemv_benchmark<3>(16384, 16384, ncu);
     run_fma_gemv_benchmark<3>(32768, 32768, ncu);
+
+    std::cout << "\n========== FMA GEMV Kernel v4 (warp-coalesced) ==========\n";
+    run_fma_gemv_benchmark<4>(4096, 4096, ncu);
+    run_fma_gemv_benchmark<4>(8192, 8192, ncu);
+    run_fma_gemv_benchmark<4>(16384, 16384, ncu);
+    run_fma_gemv_benchmark<4>(32768, 32768, ncu);
+
+    std::cout << "\n========== FMA GEMV Kernel v5 (cp.async pipelining) ==========\n";
+    run_fma_gemv_benchmark<5>(4096, 4096, ncu);
+    run_fma_gemv_benchmark<5>(8192, 8192, ncu);
+    run_fma_gemv_benchmark<5>(16384, 16384, ncu);
+    run_fma_gemv_benchmark<5>(32768, 32768, ncu);
+
+    std::cout << "\n========== FMA GEMV Kernel v6 (multi-row per warp) ==========\n";
+    run_fma_gemv_benchmark<6>(4096, 4096, ncu);
+    run_fma_gemv_benchmark<6>(8192, 8192, ncu);
+    run_fma_gemv_benchmark<6>(16384, 16384, ncu);
+    run_fma_gemv_benchmark<6>(32768, 32768, ncu);
 
     return 0;
 }

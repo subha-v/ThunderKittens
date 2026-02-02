@@ -98,9 +98,12 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
             int input_ring = 0;
 
             for (int idx = 0; idx < iters_per_task; idx++) {
+                // checking if buffer is safe to write to 
                 wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
-                update_phasebit<1>(bitfield, input_ring);
 
+
+                update_phasebit<1>(bitfield, input_ring);
+                // setting up transaction count
                 tma::expect(inputs_arrived[input_ring], a_smem[0], x_smem[0]);
                 tma::load_async(a_smem[input_ring], g.a, {row_block, idx}, inputs_arrived[input_ring]);
                 tma::load_async(x_smem[input_ring], g.x, {0, idx}, inputs_arrived[input_ring]);

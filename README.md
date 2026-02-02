@@ -21,6 +21,13 @@ ThunderKittens is built for NVIDIA GPUs. For AMD GPUs, check out [HipKittens](ht
 
 ## Recent Updates
 
+**Feb 2, 2026:** **GEMV Optimization for Blackwell B200:**
+* Added Split-K parallelization to `bf16_b200_gemv_testing.cu` - increases parallelism for small M sizes by distributing K iterations across multiple thread blocks with atomic reduction
+* Added optimized FMA kernels (v4-v6) to `bf16_b200_fma_gemv.cu`:
+  - v4: Warp-coalesced kernel - each warp computes one output row with coalesced memory access
+  - v5: cp.async pipelining with double buffering for latency hiding
+  - v6: Multi-row per warp (4 rows) for higher arithmetic intensity and better register utilization
+
 **Jan 11, 2026:** **ThunderKittens 2.0** is out!
 
 * This release brings full support for Blackwell GPUs along with MXFP8 and NVFP4 precision, and merges major contributions from across the industry.
