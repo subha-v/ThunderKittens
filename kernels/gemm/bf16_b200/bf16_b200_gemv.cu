@@ -122,7 +122,12 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
         }
         else if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
 
-            d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
+            d_tt_t d_tt;
+            if constexpr (ducks::tt::half<d_tt_t>) {
+                d_tt = tm_alloc.allocate<d_tt_t>(0, 0);
+            } else {
+                d_tt = tm_alloc.allocate<d_tt_t>(0);
+            }
             int input_ring = 0;
 
             // wait to ensure TMEM is ready
@@ -147,7 +152,12 @@ __global__ void gemv_kernel(const __grid_constant__ gemv_globals<C> g) {
         // consumer epilogue
         warpgroup::increase_registers<224>();
 
-        d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
+        d_tt_t d_tt;
+        if constexpr (ducks::tt::half<d_tt_t>) {
+            d_tt = tm_alloc.allocate<d_tt_t>(0, 0);
+        } else {
+            d_tt = tm_alloc.allocate<d_tt_t>(0);
+        }
 
         // wait for mma
         wait(outputs_arrived, 0);
@@ -352,12 +362,10 @@ __host__ int main() {
     bool ncu = false;
 
     N = 4096;
-    run_gemv_benchmark<gemv_config<32, 128, 4>>(N, N, ncu);   // 128 blocks
     run_gemv_benchmark<gemv_config<64, 128, 4>>(N, N, ncu);   // 64 blocks
     run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);  // 32 blocks (existing)
 
     N = 8192;
-    run_gemv_benchmark<gemv_config<32, 128, 4>>(N, N, ncu);   // 256 blocks
     run_gemv_benchmark<gemv_config<64, 128, 4>>(N, N, ncu);   // 128 blocks
     run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);  // 64 blocks (existing)
 
