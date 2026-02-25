@@ -351,18 +351,23 @@ __host__ int main() {
     int N;
     bool ncu = false;
 
-    // Template parameters: Mb, Kb, PIPE_DEPTH
     N = 4096;
-    run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);
+    run_gemv_benchmark<gemv_config<32, 128, 4>>(N, N, ncu);   // 128 blocks
+    run_gemv_benchmark<gemv_config<64, 128, 4>>(N, N, ncu);   // 64 blocks
+    run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);  // 32 blocks (existing)
 
     N = 8192;
-    run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);
+    run_gemv_benchmark<gemv_config<32, 128, 4>>(N, N, ncu);   // 256 blocks
+    run_gemv_benchmark<gemv_config<64, 128, 4>>(N, N, ncu);   // 128 blocks
+    run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);  // 64 blocks (existing)
 
     N = 16384;
-    run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);
+    run_gemv_benchmark<gemv_config<64, 128, 4>>(N, N, ncu);   // 256 blocks
+    run_gemv_benchmark<gemv_config<128, 128, 4>>(N, N, ncu);  // 128 blocks (existing)
 
     N = 32768;
-    run_gemv_benchmark<gemv_config<128, 64, 4>>(N, N, ncu);
+    run_gemv_benchmark<gemv_config<64, 128, 4>>(N, N, ncu);   // 512 blocks
+    run_gemv_benchmark<gemv_config<128, 64, 4>>(N, N, ncu);   // 512 blocks (existing)
 
     return 0;
 }
