@@ -6,12 +6,12 @@ using namespace kittens;
 /*
  * Optimized FMA-based GEMV: y = A * x
  *
- * Split-K strategy: the K dimension is partitioned across K_SPLITS block groups.
- * Each block computes a partial dot product for its K range and atomicAdds
- * the result into a float32 buffer. A tiny follow-up kernel converts to bf16.
- *
- * Grid: dim3(M_blocks, K_SPLITS)
- * blockIdx.x = which rows, blockIdx.y = which K split
+ * Split-K strategy with fused output:
+ *   - Grid: dim3(M_blocks, K_SPLITS)
+ *   - blockIdx.y == 0: direct store to float32 buffer (no memset needed)
+ *   - blockIdx.y >  0: spin until split 0 finishes, then atomicAdd
+ *   - Last split to finish converts float32 → bf16 inline (no second kernel)
+ *   - K_SPLITS == 1: bypasses all atomic/sync machinery, direct bf16 store
  */
 
 template <int _ROWS_PER_WARP, int _K_CHUNK, int _K_SPLITS>
@@ -24,10 +24,11 @@ struct fma_gemv_config {
     static constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
 };
 
-// Split-K FMA GEMV kernel: partial dot products accumulated via atomicAdd to float32
 template <typename Config>
-__global__ void fma_gemv_splitk_kernel(
-    float* __restrict__ y_partial,  // float32 accumulation buffer [M]
+__global__ void fma_gemv_kernel(
+    bf16* __restrict__ y,            // final bf16 output [M]
+    float* __restrict__ y_partial,   // float32 accumulation [M], unused when K_SPLITS==1
+    int* __restrict__ split_done,    // atomic counters [num_m_blocks], unused when K_SPLITS==1
     const bf16* __restrict__ A,
     const bf16* __restrict__ x,
     int M, int K
@@ -38,11 +39,9 @@ __global__ void fma_gemv_splitk_kernel(
 
     if (base_row >= M) return;
 
-    // Compute K range for this split
-    const int k_split = blockIdx.y;
+    // K range for this split
     const int k_per_split = (K + Config::K_SPLITS - 1) / Config::K_SPLITS;
-    // Align to 8 elements for vectorized loads (except last split)
-    const int k_start = k_split * k_per_split;
+    const int k_start = blockIdx.y * k_per_split;
     const int k_end = min(k_start + k_per_split, K);
 
     if (k_start >= K) return;
@@ -51,7 +50,7 @@ __global__ void fma_gemv_splitk_kernel(
 
     float acc[Config::ROWS_PER_WARP] = {0.0f};
 
-    // Precompute row pointers (offset to k_start)
+    // Precompute row pointers
     const bf16* A_row_ptrs[Config::ROWS_PER_WARP];
     #pragma unroll
     for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
@@ -60,11 +59,13 @@ __global__ void fma_gemv_splitk_kernel(
 
     constexpr int elems_per_thread = 8;
     constexpr int elems_per_pass = Config::BLOCK_SIZE * elems_per_thread;
+    constexpr int lane_stride = 32 * elems_per_thread;  // 256
 
+    // ---- Compute phase ----
     for (int k_base = k_start; k_base < k_end; k_base += Config::K_CHUNK) {
         const int k_remaining = min(Config::K_CHUNK, k_end - k_base);
 
-        // Collaborative x load into shared memory using vectorized float4 loads
+        // Collaborative x load into shared memory
         for (int offset = threadIdx.x * elems_per_thread; offset < k_remaining; offset += elems_per_pass) {
             if (offset + elems_per_thread <= k_remaining) {
                 float4 tmp = *reinterpret_cast<const float4*>(&x[k_base + offset]);
@@ -77,11 +78,7 @@ __global__ void fma_gemv_splitk_kernel(
         }
         __syncthreads();
 
-        // Compute: each lane processes 8 elements at a time with stride 256
-        const int lane_stride = 32 * elems_per_thread;  // 256
-
         for (int k = lane_id * elems_per_thread; k < k_remaining; k += lane_stride) {
-            // Load x values from shared memory
             float4 x_vec = *reinterpret_cast<const float4*>(&x_smem[k]);
             const bf16* x_ptr = reinterpret_cast<const bf16*>(&x_vec);
 
@@ -107,7 +104,7 @@ __global__ void fma_gemv_splitk_kernel(
         __syncthreads();
     }
 
-    // Warp shuffle reduction
+    // ---- Warp shuffle reduction ----
     #pragma unroll
     for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
         #pragma unroll
@@ -116,31 +113,68 @@ __global__ void fma_gemv_splitk_kernel(
         }
     }
 
-    // Lane 0 writes partial results via atomicAdd to float32 buffer
-    if (lane_id == 0) {
-        #pragma unroll
-        for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
-            if (base_row + r < M) {
-                if (Config::K_SPLITS == 1) {
-                    // No atomics needed for single split
-                    y_partial[base_row + r] = acc[r];
-                } else {
-                    atomicAdd(&y_partial[base_row + r], acc[r]);
+    // ---- Write phase ----
+
+    if constexpr (Config::K_SPLITS == 1) {
+        // No split-K: direct bf16 store, zero overhead
+        if (lane_id == 0) {
+            #pragma unroll
+            for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
+                if (base_row + r < M) {
+                    y[base_row + r] = __float2bfloat16(acc[r]);
                 }
             }
         }
-    }
-}
+    } else {
+        // Split-K: coordinate via split_done[] counters
+        __shared__ int s_is_last;
 
-// Convert float32 accumulation buffer to bf16 output
-__global__ void convert_f32_to_bf16(
-    bf16* __restrict__ y,
-    const float* __restrict__ y_f32,
-    int M
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < M) {
-        y[idx] = __float2bfloat16(y_f32[idx]);
+        // Step 1: Wait for split 0 if we're not split 0
+        if (blockIdx.y > 0) {
+            if (threadIdx.x == 0) {
+                while (atomicAdd(&split_done[blockIdx.x], 0) < 1) {
+                    // spin until split 0 has finished its direct store
+                }
+            }
+            __syncthreads();
+        }
+
+        // Step 2: Write partial results
+        if (lane_id == 0) {
+            #pragma unroll
+            for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
+                if (base_row + r < M) {
+                    if (blockIdx.y == 0) {
+                        // First split: direct store (initializes the buffer)
+                        y_partial[base_row + r] = acc[r];
+                    } else {
+                        // Subsequent splits: atomic accumulate
+                        atomicAdd(&y_partial[base_row + r], acc[r]);
+                    }
+                }
+            }
+        }
+
+        // Step 3: Ensure all warps in this block have written before signaling
+        __syncthreads();
+
+        // Step 4: Signal completion and check if we're the last split
+        if (threadIdx.x == 0) {
+            __threadfence();  // ensure y_partial writes are globally visible
+            int old = atomicAdd(&split_done[blockIdx.x], 1);
+            s_is_last = (old + 1 == Config::K_SPLITS) ? 1 : 0;
+        }
+        __syncthreads();
+
+        // Step 5: Last split converts float32 → bf16 (all threads cooperate)
+        if (s_is_last) {
+            for (int r = threadIdx.x; r < Config::ROWS_PER_BLOCK; r += Config::BLOCK_SIZE) {
+                int row = blockIdx.x * Config::ROWS_PER_BLOCK + r;
+                if (row < M) {
+                    y[row] = __float2bfloat16(y_partial[row]);
+                }
+            }
+        }
     }
 }
 
@@ -184,18 +218,27 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
     const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
 
+    const int num_m_blocks = (M + Config::ROWS_PER_BLOCK - 1) / Config::ROWS_PER_BLOCK;
+
     // Allocate device memory
     std::vector<bf16*> d_A(arg_group_count);
     std::vector<bf16*> d_x(arg_group_count);
     std::vector<bf16*> d_y(arg_group_count);
-    std::vector<float*> d_y_partial(arg_group_count);  // float32 accumulation buffer
+    std::vector<float*> d_y_partial(arg_group_count);
+    std::vector<int*> d_split_done(arg_group_count);
     bf16* d_y_ref;
 
     for (int i = 0; i < arg_group_count; i++) {
         CUDACHECK(cudaMalloc(&d_A[i], M * K * sizeof(bf16)));
         CUDACHECK(cudaMalloc(&d_x[i], K * sizeof(bf16)));
         CUDACHECK(cudaMalloc(&d_y[i], M * sizeof(bf16)));
-        CUDACHECK(cudaMalloc(&d_y_partial[i], M * sizeof(float)));
+        if constexpr (Config::K_SPLITS > 1) {
+            CUDACHECK(cudaMalloc(&d_y_partial[i], M * sizeof(float)));
+            CUDACHECK(cudaMalloc(&d_split_done[i], num_m_blocks * sizeof(int)));
+        } else {
+            d_y_partial[i] = nullptr;
+            d_split_done[i] = nullptr;
+        }
     }
     CUDACHECK(cudaMalloc(&d_y_ref, M * sizeof(bf16)));
     std::cout << "Allocated device memory" << std::endl;
@@ -206,7 +249,6 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         fill<bf16, FillMode::RANDOM>(d_A[i], M * K, seed + i * 100, -1.0f, 1.0f);
         fill<bf16, FillMode::RANDOM>(d_x[i], K, seed + i * 100 + 1, -1.0f, 1.0f);
         fill<bf16, FillMode::CONSTANT>(d_y[i], M, 0.0f);
-        CUDACHECK(cudaMemset(d_y_partial[i], 0, M * sizeof(float)));
     }
     fill<bf16, FillMode::CONSTANT>(d_y_ref, M, 0.0f);
     CUDACHECK(cudaDeviceSynchronize());
@@ -219,13 +261,10 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
 
     // Kernel launch parameters
     dim3 block(Config::BLOCK_SIZE);
-    dim3 grid((M + Config::ROWS_PER_BLOCK - 1) / Config::ROWS_PER_BLOCK, Config::K_SPLITS);
-    dim3 convert_block(256);
-    dim3 convert_grid((M + 255) / 256);
+    dim3 grid(num_m_blocks, Config::K_SPLITS);
 
-    int m_blocks = (M + Config::ROWS_PER_BLOCK - 1) / Config::ROWS_PER_BLOCK;
-    std::cout << "Grid: (" << m_blocks << ", " << Config::K_SPLITS << ") = "
-              << m_blocks * Config::K_SPLITS << " total blocks\n";
+    std::cout << "Grid: (" << num_m_blocks << ", " << Config::K_SPLITS << ") = "
+              << num_m_blocks * Config::K_SPLITS << " total blocks\n";
 
     // Number of iterations
     int num_warmups = ncu ? 0 : 500;
@@ -234,9 +273,12 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     // Warmup
     for (int i = 0; i < num_warmups; i++) {
         int idx = i % arg_group_count;
-        CUDACHECK(cudaMemset(d_y_partial[idx], 0, M * sizeof(float)));
-        fma_gemv_splitk_kernel<Config><<<grid, block>>>(d_y_partial[idx], d_A[idx], d_x[idx], M, K);
-        convert_f32_to_bf16<<<convert_grid, convert_block>>>(d_y[idx], d_y_partial[idx], M);
+        // Only need to reset the tiny split_done counters (not y_partial!)
+        if constexpr (Config::K_SPLITS > 1) {
+            CUDACHECK(cudaMemsetAsync(d_split_done[idx], 0, num_m_blocks * sizeof(int)));
+        }
+        fma_gemv_kernel<Config><<<grid, block>>>(
+            d_y[idx], d_y_partial[idx], d_split_done[idx], d_A[idx], d_x[idx], M, K);
     }
     CUDACHECK(cudaDeviceSynchronize());
 
@@ -248,9 +290,11 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
 
     for (int i = 0; i < num_iters; i++) {
         int idx = i % arg_group_count;
-        CUDACHECK(cudaMemsetAsync(d_y_partial[idx], 0, M * sizeof(float)));
-        fma_gemv_splitk_kernel<Config><<<grid, block>>>(d_y_partial[idx], d_A[idx], d_x[idx], M, K);
-        convert_f32_to_bf16<<<convert_grid, convert_block>>>(d_y[idx], d_y_partial[idx], M);
+        if constexpr (Config::K_SPLITS > 1) {
+            CUDACHECK(cudaMemsetAsync(d_split_done[idx], 0, num_m_blocks * sizeof(int)));
+        }
+        fma_gemv_kernel<Config><<<grid, block>>>(
+            d_y[idx], d_y_partial[idx], d_split_done[idx], d_A[idx], d_x[idx], M, K);
     }
 
     CUDACHECK(cudaEventRecord(stop));
@@ -268,10 +312,12 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::cout << "Achieved bandwidth: " << gb_per_sec << " GB/s\n";
     std::cout << "Achieved performance: " << gflops << " GFLOPs\n";
 
-    // Verify correctness (run once cleanly for check)
-    CUDACHECK(cudaMemset(d_y_partial[0], 0, M * sizeof(float)));
-    fma_gemv_splitk_kernel<Config><<<grid, block>>>(d_y_partial[0], d_A[0], d_x[0], M, K);
-    convert_f32_to_bf16<<<convert_grid, convert_block>>>(d_y[0], d_y_partial[0], M);
+    // Verify correctness (clean run)
+    if constexpr (Config::K_SPLITS > 1) {
+        CUDACHECK(cudaMemset(d_split_done[0], 0, num_m_blocks * sizeof(int)));
+    }
+    fma_gemv_kernel<Config><<<grid, block>>>(
+        d_y[0], d_y_partial[0], d_split_done[0], d_A[0], d_x[0], M, K);
     CUDACHECK(cudaDeviceSynchronize());
     check_correctness(d_y[0], d_y_ref, M);
 
@@ -280,7 +326,8 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         cudaFree(d_A[i]);
         cudaFree(d_x[i]);
         cudaFree(d_y[i]);
-        cudaFree(d_y_partial[i]);
+        if (d_y_partial[i]) cudaFree(d_y_partial[i]);
+        if (d_split_done[i]) cudaFree(d_split_done[i]);
     }
     cudaFree(d_y_ref);
     cudaEventDestroy(start);
@@ -292,7 +339,7 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
 __host__ int main() {
     bool ncu = false;
 
-    // RPW=2 is the best from previous experiment. Sweep K_SPLITS.
+    // RPW=2 is best. Sweep K_SPLITS with fused kernel.
 
     std::cout << "\n========== FMA GEMV: RPW=2, K_CHUNK=2048, K_SPLITS=1 (baseline) ==========\n";
     run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 1>>(4096, 4096, ncu);
