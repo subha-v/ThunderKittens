@@ -6,25 +6,28 @@ using namespace kittens;
 /*
  * Optimized FMA-based GEMV: y = A * x
  *
- * Uses CUDA cores (FMA instructions) instead of tensor cores.
- * Each warp handles ROWS_PER_WARP output rows, with all 32 lanes
- * collaborating on the K-dimension dot product via shuffle reduction.
- * x is loaded into shared memory in K_CHUNK-sized tiles with vectorized float4 loads.
- * A is read with vectorized float4 loads (8 bf16 per load) for high bandwidth.
+ * Split-K strategy: the K dimension is partitioned across K_SPLITS block groups.
+ * Each block computes a partial dot product for its K range and atomicAdds
+ * the result into a float32 buffer. A tiny follow-up kernel converts to bf16.
+ *
+ * Grid: dim3(M_blocks, K_SPLITS)
+ * blockIdx.x = which rows, blockIdx.y = which K split
  */
 
-template <int _ROWS_PER_WARP, int _K_CHUNK>
+template <int _ROWS_PER_WARP, int _K_CHUNK, int _K_SPLITS>
 struct fma_gemv_config {
     static constexpr int BLOCK_SIZE = 256;
     static constexpr int ROWS_PER_WARP = _ROWS_PER_WARP;
     static constexpr int K_CHUNK = _K_CHUNK;
+    static constexpr int K_SPLITS = _K_SPLITS;
     static constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;  // 8
     static constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
 };
 
+// Split-K FMA GEMV kernel: partial dot products accumulated via atomicAdd to float32
 template <typename Config>
-__global__ void fma_gemv_kernel(
-    bf16* __restrict__ y,
+__global__ void fma_gemv_splitk_kernel(
+    float* __restrict__ y_partial,  // float32 accumulation buffer [M]
     const bf16* __restrict__ A,
     const bf16* __restrict__ x,
     int M, int K
@@ -35,32 +38,38 @@ __global__ void fma_gemv_kernel(
 
     if (base_row >= M) return;
 
+    // Compute K range for this split
+    const int k_split = blockIdx.y;
+    const int k_per_split = (K + Config::K_SPLITS - 1) / Config::K_SPLITS;
+    // Align to 8 elements for vectorized loads (except last split)
+    const int k_start = k_split * k_per_split;
+    const int k_end = min(k_start + k_per_split, K);
+
+    if (k_start >= K) return;
+
     __shared__ bf16 x_smem[Config::K_CHUNK];
 
     float acc[Config::ROWS_PER_WARP] = {0.0f};
 
-    // Precompute row pointers
+    // Precompute row pointers (offset to k_start)
     const bf16* A_row_ptrs[Config::ROWS_PER_WARP];
     #pragma unroll
     for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
         A_row_ptrs[r] = A + (base_row + r) * K;
     }
 
-    for (int k_base = 0; k_base < K; k_base += Config::K_CHUNK) {
-        // Collaborative x load into shared memory using vectorized float4 loads
-        // float4 = 16 bytes = 8 bf16 elements per thread
-        // 256 threads * 8 elements = 2048 elements per pass
-        const int elems_per_thread = 8;
-        const int elems_per_pass = Config::BLOCK_SIZE * elems_per_thread;
-        const int k_remaining = min(Config::K_CHUNK, K - k_base);
+    constexpr int elems_per_thread = 8;
+    constexpr int elems_per_pass = Config::BLOCK_SIZE * elems_per_thread;
 
+    for (int k_base = k_start; k_base < k_end; k_base += Config::K_CHUNK) {
+        const int k_remaining = min(Config::K_CHUNK, k_end - k_base);
+
+        // Collaborative x load into shared memory using vectorized float4 loads
         for (int offset = threadIdx.x * elems_per_thread; offset < k_remaining; offset += elems_per_pass) {
             if (offset + elems_per_thread <= k_remaining) {
-                // Vectorized float4 load (16 bytes = 8 bf16)
                 float4 tmp = *reinterpret_cast<const float4*>(&x[k_base + offset]);
                 *reinterpret_cast<float4*>(&x_smem[offset]) = tmp;
             } else {
-                // Handle tail elements
                 for (int i = 0; i < elems_per_thread && (offset + i) < k_remaining; i++) {
                     x_smem[offset + i] = x[k_base + offset + i];
                 }
@@ -68,8 +77,7 @@ __global__ void fma_gemv_kernel(
         }
         __syncthreads();
 
-        // Compute: each lane processes elements with stride of 32 lanes * 8 elements = 256
-        // Each lane loads float4 (8 bf16) from A, unpacks and does 8 FMAs
+        // Compute: each lane processes 8 elements at a time with stride 256
         const int lane_stride = 32 * elems_per_thread;  // 256
 
         for (int k = lane_id * elems_per_thread; k < k_remaining; k += lane_stride) {
@@ -86,7 +94,6 @@ __global__ void fma_gemv_kernel(
             #pragma unroll
             for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
                 if (base_row + r < M) {
-                    // Vectorized float4 load from A
                     float4 a_vec = *reinterpret_cast<const float4*>(&A_row_ptrs[r][k_base + k]);
                     const bf16* a_ptr = reinterpret_cast<const bf16*>(&a_vec);
 
@@ -109,14 +116,31 @@ __global__ void fma_gemv_kernel(
         }
     }
 
-    // Lane 0 writes results
+    // Lane 0 writes partial results via atomicAdd to float32 buffer
     if (lane_id == 0) {
         #pragma unroll
         for (int r = 0; r < Config::ROWS_PER_WARP; r++) {
             if (base_row + r < M) {
-                y[base_row + r] = __float2bfloat16(acc[r]);
+                if (Config::K_SPLITS == 1) {
+                    // No atomics needed for single split
+                    y_partial[base_row + r] = acc[r];
+                } else {
+                    atomicAdd(&y_partial[base_row + r], acc[r]);
+                }
             }
         }
+    }
+}
+
+// Convert float32 accumulation buffer to bf16 output
+__global__ void convert_f32_to_bf16(
+    bf16* __restrict__ y,
+    const float* __restrict__ y_f32,
+    int M
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < M) {
+        y[idx] = __float2bfloat16(y_f32[idx]);
     }
 }
 
@@ -147,6 +171,7 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::cout << "--------------------  M=" << M << " K=" << K << "  --------------------\n";
     std::cout << "Config: ROWS_PER_WARP=" << Config::ROWS_PER_WARP
               << " K_CHUNK=" << Config::K_CHUNK
+              << " K_SPLITS=" << Config::K_SPLITS
               << " BLOCK_SIZE=" << Config::BLOCK_SIZE << "\n";
 
     // Cooldown between configurations
@@ -163,12 +188,14 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::vector<bf16*> d_A(arg_group_count);
     std::vector<bf16*> d_x(arg_group_count);
     std::vector<bf16*> d_y(arg_group_count);
+    std::vector<float*> d_y_partial(arg_group_count);  // float32 accumulation buffer
     bf16* d_y_ref;
 
     for (int i = 0; i < arg_group_count; i++) {
         CUDACHECK(cudaMalloc(&d_A[i], M * K * sizeof(bf16)));
         CUDACHECK(cudaMalloc(&d_x[i], K * sizeof(bf16)));
         CUDACHECK(cudaMalloc(&d_y[i], M * sizeof(bf16)));
+        CUDACHECK(cudaMalloc(&d_y_partial[i], M * sizeof(float)));
     }
     CUDACHECK(cudaMalloc(&d_y_ref, M * sizeof(bf16)));
     std::cout << "Allocated device memory" << std::endl;
@@ -179,6 +206,7 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         fill<bf16, FillMode::RANDOM>(d_A[i], M * K, seed + i * 100, -1.0f, 1.0f);
         fill<bf16, FillMode::RANDOM>(d_x[i], K, seed + i * 100 + 1, -1.0f, 1.0f);
         fill<bf16, FillMode::CONSTANT>(d_y[i], M, 0.0f);
+        CUDACHECK(cudaMemset(d_y_partial[i], 0, M * sizeof(float)));
     }
     fill<bf16, FillMode::CONSTANT>(d_y_ref, M, 0.0f);
     CUDACHECK(cudaDeviceSynchronize());
@@ -191,7 +219,13 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
 
     // Kernel launch parameters
     dim3 block(Config::BLOCK_SIZE);
-    dim3 grid((M + Config::ROWS_PER_BLOCK - 1) / Config::ROWS_PER_BLOCK);
+    dim3 grid((M + Config::ROWS_PER_BLOCK - 1) / Config::ROWS_PER_BLOCK, Config::K_SPLITS);
+    dim3 convert_block(256);
+    dim3 convert_grid((M + 255) / 256);
+
+    int m_blocks = (M + Config::ROWS_PER_BLOCK - 1) / Config::ROWS_PER_BLOCK;
+    std::cout << "Grid: (" << m_blocks << ", " << Config::K_SPLITS << ") = "
+              << m_blocks * Config::K_SPLITS << " total blocks\n";
 
     // Number of iterations
     int num_warmups = ncu ? 0 : 500;
@@ -200,7 +234,9 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     // Warmup
     for (int i = 0; i < num_warmups; i++) {
         int idx = i % arg_group_count;
-        fma_gemv_kernel<Config><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        CUDACHECK(cudaMemset(d_y_partial[idx], 0, M * sizeof(float)));
+        fma_gemv_splitk_kernel<Config><<<grid, block>>>(d_y_partial[idx], d_A[idx], d_x[idx], M, K);
+        convert_f32_to_bf16<<<convert_grid, convert_block>>>(d_y[idx], d_y_partial[idx], M);
     }
     CUDACHECK(cudaDeviceSynchronize());
 
@@ -212,7 +248,9 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
 
     for (int i = 0; i < num_iters; i++) {
         int idx = i % arg_group_count;
-        fma_gemv_kernel<Config><<<grid, block>>>(d_y[idx], d_A[idx], d_x[idx], M, K);
+        CUDACHECK(cudaMemsetAsync(d_y_partial[idx], 0, M * sizeof(float)));
+        fma_gemv_splitk_kernel<Config><<<grid, block>>>(d_y_partial[idx], d_A[idx], d_x[idx], M, K);
+        convert_f32_to_bf16<<<convert_grid, convert_block>>>(d_y[idx], d_y_partial[idx], M);
     }
 
     CUDACHECK(cudaEventRecord(stop));
@@ -230,7 +268,11 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
     std::cout << "Achieved bandwidth: " << gb_per_sec << " GB/s\n";
     std::cout << "Achieved performance: " << gflops << " GFLOPs\n";
 
-    // Verify correctness
+    // Verify correctness (run once cleanly for check)
+    CUDACHECK(cudaMemset(d_y_partial[0], 0, M * sizeof(float)));
+    fma_gemv_splitk_kernel<Config><<<grid, block>>>(d_y_partial[0], d_A[0], d_x[0], M, K);
+    convert_f32_to_bf16<<<convert_grid, convert_block>>>(d_y[0], d_y_partial[0], M);
+    CUDACHECK(cudaDeviceSynchronize());
     check_correctness(d_y[0], d_y_ref, M);
 
     // Cleanup
@@ -238,6 +280,7 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
         cudaFree(d_A[i]);
         cudaFree(d_x[i]);
         cudaFree(d_y[i]);
+        cudaFree(d_y_partial[i]);
     }
     cudaFree(d_y_ref);
     cudaEventDestroy(start);
@@ -249,23 +292,31 @@ __host__ double run_fma_gemv_benchmark(size_t M, size_t K, bool ncu = false) {
 __host__ int main() {
     bool ncu = false;
 
-    std::cout << "\n========== FMA GEMV: ROWS_PER_WARP=2, K_CHUNK=2048 ==========\n";
-    run_fma_gemv_benchmark<fma_gemv_config<2, 2048>>(4096, 4096, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<2, 2048>>(8192, 8192, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<2, 2048>>(16384, 16384, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<2, 2048>>(32768, 32768, ncu);
+    // RPW=2 is the best from previous experiment. Sweep K_SPLITS.
 
-    std::cout << "\n========== FMA GEMV: ROWS_PER_WARP=4, K_CHUNK=2048 ==========\n";
-    run_fma_gemv_benchmark<fma_gemv_config<4, 2048>>(4096, 4096, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<4, 2048>>(8192, 8192, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<4, 2048>>(16384, 16384, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<4, 2048>>(32768, 32768, ncu);
+    std::cout << "\n========== FMA GEMV: RPW=2, K_CHUNK=2048, K_SPLITS=1 (baseline) ==========\n";
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 1>>(4096, 4096, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 1>>(8192, 8192, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 1>>(16384, 16384, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 1>>(32768, 32768, ncu);
 
-    std::cout << "\n========== FMA GEMV: ROWS_PER_WARP=8, K_CHUNK=2048 ==========\n";
-    run_fma_gemv_benchmark<fma_gemv_config<8, 2048>>(4096, 4096, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<8, 2048>>(8192, 8192, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<8, 2048>>(16384, 16384, ncu);
-    run_fma_gemv_benchmark<fma_gemv_config<8, 2048>>(32768, 32768, ncu);
+    std::cout << "\n========== FMA GEMV: RPW=2, K_CHUNK=2048, K_SPLITS=2 ==========\n";
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 2>>(4096, 4096, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 2>>(8192, 8192, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 2>>(16384, 16384, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 2>>(32768, 32768, ncu);
+
+    std::cout << "\n========== FMA GEMV: RPW=2, K_CHUNK=2048, K_SPLITS=4 ==========\n";
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 4>>(4096, 4096, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 4>>(8192, 8192, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 4>>(16384, 16384, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 4>>(32768, 32768, ncu);
+
+    std::cout << "\n========== FMA GEMV: RPW=2, K_CHUNK=2048, K_SPLITS=8 ==========\n";
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 8>>(4096, 4096, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 8>>(8192, 8192, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 8>>(16384, 16384, ncu);
+    run_fma_gemv_benchmark<fma_gemv_config<2, 2048, 8>>(32768, 32768, ncu);
 
     return 0;
 }
